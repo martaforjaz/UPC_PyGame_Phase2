@@ -1,0 +1,11 @@
+# Required external libraries for the UPC_PyGame project:
+
+fastapi         # For building the web API
+uvicorn         # ASGI server to run the FastAPI application
+pygame          # For 2D graphics, visualization, and input handling (in agent)
+pymunk          # For the 2D physics engine simulation
+requests        # For making HTTP requests (used by the agent to communicate with the API)
+matplotlib      # For plotting and visualizing data (used by the agent)
+
+# Standard libraries like asyncio, math, time, threading, uuid, random, sys, jsonsys, json
+# are part of Python and do not need to be listed here.
