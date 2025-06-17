@@ -4,11 +4,16 @@ import time
 import matplotlib.pyplot as plt
 import heapq  
 import random
-
+import math
+from scipy.signal import correlate2d
+from scipy.ndimage import gaussian_filter
 
 class WorldModel:
     def __init__(self, grid_size=100, resolution=10, agent_id="unknown"):
         #self.grid = np.zeros((grid_size, grid_size), dtype=np.float32)
+        
+        self.enemy_history = {}  # {enemy_id: {"last_pos": (x,y), "last_time": t, "velocity": (vx, vy)}}
+        
         self.position_history = deque(maxlen=1000)
         self.estimated_pose = np.array([0.0, 0.0, 0.0]) 
         self.resolution = resolution
@@ -20,13 +25,6 @@ class WorldModel:
         self.grid_width = self.world_width // self.resolution  # = 500
         self.grid_height = self.world_height // self.resolution
         self.grid = np.zeros((self.grid_width, self.grid_height), dtype=np.float32)
-
-
-        # Gurada limites maximos e mínimos observados das posições do agente
-        self.min_x = float('inf')
-        self.max_x = float('-inf')
-        self.min_y = float('inf')
-        self.max_y = float('-inf')
 
         self.known_objects = []
         self.first_update = True
@@ -64,36 +62,46 @@ class WorldModel:
         self.min_y = min(self.min_y, y)
         self.max_y = max(self.max_y, y)
 
-        print(f"[DEBUG MAP SIZE] X ∈ [{self.min_x:.2f}, {self.max_x:.2f}] | Y ∈ [{self.min_y:.2f}, {self.max_y:.2f}]")
-
     def update_from_scan(self, scan_data):
-        print("[DEBUG] update_from_scan foi chamado")
+        #print("[DEBUG] update_from_scan foi chamado")
         if not scan_data or 'nearby_objects' not in scan_data:
             return
 
         temp_objects = []
+        border_safety_margin = 3  # Número de células a marcar como perigosas antes da borda real
 
         for obj in scan_data['nearby_objects']:
-            print(f"[DEBUG] Objeto recebido: {obj}")
+            #print(f"[DEBUG] Objeto recebido: {obj}")
             rel_x, rel_y = obj['relative_position']
             abs_x = self.estimated_pose[0] + rel_x
             abs_y = self.estimated_pose[1] + rel_y
 
             grid_x, grid_y = self.world_to_grid((abs_x, abs_y))
+            
             if grid_x is None or grid_y is None:
-                print(f"[DEBUG] Objeto ignorado fora do mapa: ({abs_x:.2f}, {abs_y:.2f})")
+                #print(f"[DEBUG] Objeto ignorado fora do mapa: ({abs_x:.2f}, {abs_y:.2f})")
                 continue  # ignora objetos fora do mapa
 
 
             if 0 <= grid_x < self.grid_width and 0 <= grid_y < self.grid_height:
-                if obj['type'] == 'obstacle' or obj['type'] == 'border':
+            
+                # Objeto é borda ou obstáculo
+                if obj['type'] == 'border' or obj['type'] == 'obstacle':
                     self.grid[grid_y, grid_x] = 1.0
                     self.accumulated_obstacles.add((grid_x, grid_y))
+                    
+                    # Marca células adjacentes à borda como perigosas (zona de segurança)
+                    for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]:
+                        nx, ny = grid_x + dx, grid_y + dy
+                        if 0 <= nx < self.grid_width and 0 <= ny < self.grid_height:
+                            if obj['type'] == 'border':  # Só aplica margem de segurança para bordas
+                                self.grid[ny, nx] = min(1.0, self.grid[ny, nx] + 0.5)  # Valor intermediário
+                                
                 elif obj['type'] == 'other_player':
                     self.accumulated_enemies.add((grid_x, grid_y))
                 else:
                     self.grid[grid_y, grid_x] = max(0.0, self.grid[grid_y, grid_x] - 0.1)
-                
+                    
             temp_objects.append({
                 'type': obj['type'],
                 'position': (abs_x, abs_y),
@@ -101,17 +109,16 @@ class WorldModel:
                 'last_seen': time.time()
             })
             
+        # Atualiza obstáculos acumulados
         for (ox, oy) in self.accumulated_obstacles:
-                try:
-                    gx, gy = self.world_to_grid((ox, oy))
-                    if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height:
-                        self.grid[gy, gx] = 1  # marca célula como ocupada
-                except Exception as e:
-                    print(f"[DEBUG] Erro ao converter obstáculo ({ox},{oy}) para grid: {e}")
+            try:
+                gx, gy = self.world_to_grid((ox, oy))
+                if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height:
+                    self.grid[gy, gx] = 1
+            except Exception as e:
+                print(f"[DEBUG] Erro ao converter obstáculo ({ox},{oy}) para grid: {e}")
 
-            
-        n_ocupadas = np.count_nonzero(self.grid)
-        print(f"[DEBUG] Nº células ocupadas: {n_ocupadas}")
+        self.known_objects = temp_objects
 
         self.known_objects = temp_objects
         #print(f"[DEBUG] Objetos armazenados: {len(self.known_objects)}")
@@ -165,28 +172,26 @@ class WorldModel:
     # posição inicial start_pos e a posição final goal_pos
     # evitando obstáculos registados na grelha self.grid.
     def plan_path_a_star(self, start_pos, goal_pos):
-        # Converter coordenadas reais para coordenadas da grelha
         start = self.world_to_grid(start_pos)
         goal = self.world_to_grid(goal_pos)
         if None in start or None in goal:
-            return []  # posição inválida
+            return []
 
-        #Para cada nó (x, y) verifica os vizinhos 
-        # 4-conectados (esquerda, direita, cima, baixo).
-        def neighbors(node):
-            x, y = node
-            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < self.grid_width and 0 <= ny < self.grid_height:
-                    if self.grid[ny][nx] < 0.5:  # <<< INVERTIDO AQUI!
-                        yield (nx, ny)
-
-        open_set = [(0, start)]
+        # Usar fila prioritária mais eficiente
+        open_set = []
+        heapq.heappush(open_set, (0, start))
+        
         came_from = {}
         g_score = {start: 0}
+        f_score = {start: math.hypot(start[0]-goal[0], start[1]-goal[1])}
+        
+        # Usar um set para verificação mais rápida
+        open_set_hash = {start}
 
         while open_set:
             _, current = heapq.heappop(open_set)
+            open_set_hash.remove(current)
+            
             if current == goal:
                 path = []
                 while current in came_from:
@@ -195,36 +200,23 @@ class WorldModel:
                 path.reverse()
                 return [self.grid_to_world(x, y) for (x, y) in path]
 
-            for neighbor in neighbors(current):
-                tentative_g = g_score[current] + 1
-                if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                    g_score[neighbor] = tentative_g
-                    priority = tentative_g + np.linalg.norm(np.subtract(neighbor, goal))
-                    heapq.heappush(open_set, (priority, neighbor))
-                    came_from[neighbor] = current
+            # Modifique o loop de vizinhos para incluir diagonais:
+            for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]:  # 8-direções
+                neighbor = (current[0] + dx, current[1] + dy)
+                if 0 <= neighbor[0] < self.grid_width and 0 <= neighbor[1] < self.grid_height:
+                    if self.grid[neighbor[1]][neighbor[0]] < 0.5:
+                        # Custo diagonal: sqrt(2) ≈ 1.4
+                        cost = 1.4 if dx != 0 and dy != 0 else 1.0
+                        tentative_g = g_score[current] + cost
+                        if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                            came_from[neighbor] = current
+                            g_score[neighbor] = tentative_g
+                            f_score[neighbor] = tentative_g + 1.5 * math.hypot(neighbor[0]-goal[0], neighbor[1]-goal[1])  # Heurística mais agressiva
+                            if neighbor not in open_set_hash:
+                                heapq.heappush(open_set, (f_score[neighbor], neighbor))
+                                open_set_hash.add(neighbor)
 
         return []
-
-    
-    def get_occupancy_grid(self, grid_size=21):
-        cx, cy = self.world_to_grid(self.estimated_pose[:2])
-        half = grid_size // 2
-        occupancy = []
-
-        for dy in range(-half, half + 1):
-            row = []
-            for dx in range(-half, half + 1):
-                gx = cx + dx
-                gy = cy + dy
-                if 0 <= gx < self.grid_width and 0 <= gy < self.grid_height:
-                    if self.grid[gy][gx] > 0.5:
-                        row.append('#')  # obstáculo
-                    else:
-                        row.append('.')  # livre
-                else:
-                    row.append('#')  # fora do mapa é bloqueado
-            occupancy.append(row)
-        return occupancy
 
     def get_closest_enemy_position(self):
         if not self.known_objects:
@@ -246,3 +238,41 @@ class WorldModel:
         print("[WARN] Nenhum goal livre encontrado.")
         return position
 
+    '''
+    def refine_pose_with_correlation(self, scan_data):
+        if not scan_data or 'nearby_objects' not in scan_data:
+            return
+
+        grid_bin = (self.grid > 0.5).astype(np.uint8)
+        mask = self.build_scan_mask(scan_data, size=21)
+
+        # Verifica se a máscara tem alguma coisa útil
+        if np.sum(mask) == 0:
+            return
+
+        # Fazer correlação (valid = sem extrapolar fronteiras)
+        corr = correlate2d(grid_bin, mask, mode='valid')
+
+        # Encontrar posição de melhor matching
+        gy, gx = np.unravel_index(np.argmax(corr), corr.shape)
+
+        self.estimated_pose[0] = gx * self.resolution
+        self.estimated_pose[1] = gy * self.resolution
+
+        print(f"[REFINE-CORR] Nova pose refinada com correlação: ({self.estimated_pose[0]:.2f}, {self.estimated_pose[1]:.2f})")
+    
+    def build_scan_mask(self, scan_data, size=21):
+        mask = np.zeros((size, size), dtype=np.uint8)
+        center = size // 2
+
+        for obj in scan_data.get("nearby_objects", []):
+            if obj["type"] not in ("obstacle", "border"):
+                continue
+            rel_x, rel_y = obj["relative_position"]
+            gx = int(center + rel_x / self.resolution)
+            gy = int(center - rel_y / self.resolution)
+            if 0 <= gx < size and 0 <= gy < size:
+                mask[gy, gx] = 1
+
+        return gaussian_filter(mask, sigma=1)
+'''

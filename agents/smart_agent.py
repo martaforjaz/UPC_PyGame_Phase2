@@ -17,7 +17,7 @@ class SmartAgent:
         self.last_shot_time = 0
         self.shot_cooldown = 1.0  # segundos
         self.last_plan_time = 0  # Tempo do último planeamento de caminho
-        self.plan_interval = 2.0  # Intervalo entre planos de caminho (em segundos)
+        self.plan_interval = 0.5  # Intervalo entre planos de caminho (em segundos)
 
     def connect(self, agent_name="smart_agent"):
         try:
@@ -128,6 +128,7 @@ class SmartAgent:
                 # Atualiza o modelo do mundo
                 self.world_model.update_pose(self_state)
                 self.world_model.update_from_scan(scan)
+                #self.world_model.refine_pose_with_correlation(scan)
 
                 # Estado atual
                 position = self_state.get("position") or self_state.get("pos") or [0, 0]
@@ -163,15 +164,14 @@ class SmartAgent:
                     angle_to_target = math.atan2(dy, dx)
                     angle_diff = (angle_to_target - orientation + math.pi) % (2 * math.pi) - math.pi
 
-                    if abs(angle_diff) > 0.3:
+                    if abs(angle_diff) > 0.05:  # Limiar mais sensível (~8.5 graus)
                         if angle_diff > 0:
                             self.rotate_right()
                         else:
                             self.rotate_left()
-                    else:
-                        self.thrust()
-                        if math.hypot(dx, dy) < 5:
-                            self.path.pop(0)
+                    self.thrust()  # Sempre aplica thrust, mesmo durante rotação
+                    if math.hypot(dx, dy) < 3:  # Distância menor para waypoints
+                        self.path.pop(0)
                 #print(f"[DEBUG] Dir. alvo: {angle_to_target:.2f} rad | Dir. atual: {orientation:.2f} | Diferença: {angle_diff:.2f}")
 
                 # Disparo automático se inimigo estiver alinhado
