@@ -1,192 +1,198 @@
-"""
-Smart Agent - Versão com Modelo de Mundo Interno
-"""
-
 import requests
 import time
+from world_model import WorldModel
+import heapq
 import math
-from src.settings import API_URL
-from world_model import WorldModel  # Importa o modelo de mundo
+import numpy as np
 
 class SmartAgent:
     def __init__(self):
         self.player_id = None
-        self.angle = 0
-        self.health = 100
-        self.game_started = False
+        self.api_base = "http://127.0.0.1:8000"
         self.last_scan_time = 0
-        self.connection_retries = 3
-        self.world_model = WorldModel()  # Instancia o modelo de mundo
-        self.connect()
+        self.start_time = time.time()  # <- NOVO
+        self.scan_cooldown = 0.6
+        self.world_model = WorldModel(grid_size=200, resolution=2, agent_id=str(id(self)))
+        self.path = []  # Caminho planeado a seguir com A*
+        self.last_shot_time = 0
+        self.shot_cooldown = 1.0  # segundos
+        self.last_plan_time = 0  # Tempo do último planeamento de caminho
+        self.plan_interval = 2.0  # Intervalo entre planos de caminho (em segundos)
 
-    def robust_request(self, method, endpoint, **kwargs):
-        """Método de requisição com tratamento de erros avançado"""
-        for attempt in range(self.connection_retries):
-            try:
-                response = requests.request(
-                    method,
-                    f"{API_URL}{endpoint}",
-                    timeout=1.5,
-                    **kwargs
-                )
-                return response
-            except requests.exceptions.ConnectionError as e:
-                print(f"⚠️ Erro de conexão (tentativa {attempt + 1}): {str(e)}")
-                if attempt < self.connection_retries - 1:
-                    time.sleep(1)
-            except requests.exceptions.Timeout:
-                print(f"⌛ Timeout (tentativa {attempt + 1})")
-                if attempt < self.connection_retries - 1:
-                    time.sleep(1)
-            except Exception as e:
-                print(f"⚠️ Erro inesperado: {str(e)}")
-                break
-        return None
-
-    def connect(self):
-        """Conecta ao servidor com múltiplas tentativas"""
-        print("🟢 Conectando ao servidor...")
-        response = self.robust_request("POST", "/connect", json={"agent_name": "SmartAgent_Pro"})
-        
-        if response and response.status_code == 200:
-            self.player_id = response.json().get("player_id")
-            print(f"✅ Conectado como jogador {self.player_id}")
-        else:
-            print("❌ Falha na conexão após várias tentativas")
-            raise ConnectionError("Não foi possível conectar ao servidor")
-
-    def send_ready(self):
-        """Envia sinal de pronto com confirmação"""
-        response = self.robust_request("POST", f"/player/ready/{self.player_id}")
-        if response and response.status_code == 200:
-            print("✅ Sinal de pronto confirmado")
+    def connect(self, agent_name="smart_agent"):
+        try:
+            response = requests.post(
+                f"{self.api_base}/connect",
+                json={"agent_name": agent_name},
+                timeout=2
+            )
+            response.raise_for_status()
+            data = response.json()
+            self.player_id = data.get("player_id")
+            print(f"[INFO] Connected successfully. Player ID: {self.player_id}")
             return True
-        return False
+        except requests.exceptions.RequestException as e:
+            print(f"[ERROR] Connection failed: {e}")
+            return False
 
-    def update_game_state(self):
-        """Atualiza o estado do jogo de forma consistente"""
-        response = self.robust_request("GET", f"/player/{self.player_id}/game-state")
-         
-        if response and response.status_code == 200:
-            game_state = response.json()
-            
-            print("\n=== ESTADO DO JOGO ===")
-            print(f"Tempo de jogo: {game_state.get('game_time', 0):.1f}s")
-        
-            self.angle = game_state.get('angle', self.angle)
-            
-            # Mostra informações de todos os jogadores
-            players = game_state.get('players', [])
-            print(f"Jogadores ativos: {len(players)}")
-            for player in players:
-                status = "✅" if player.get('health', 0) > 0 else "💀"
-                print(f"  {status} {player.get('name', 'unknown')} - Saúde: {player.get('health', 0)} | Pos: {player.get('position', [0,0])}")
-            
-             # Atualiza saúde do próprio agente
-            self.health = game_state.get('health', self.health)
-            self.world_model.health = self.health
-            
-            return True
-        print("⚠️ Não foi possível atualizar o estado do jogo")
-        return False
+    def ready_up(self):
+        try:
+            response = requests.post(
+                f"{self.api_base}/player/ready/{self.player_id}",
+                timeout=1
+            )
+            response.raise_for_status()
+            print(f"[INFO] Player {self.player_id} is ready to play.")
+        except requests.exceptions.RequestException as e:
+            print(f"[ERROR] Failed to set ready status: {e}")
 
-    def update_scan_data(self):
-        response = self.robust_request("GET", f"/player/{self.player_id}/scan")
-        if response and response.status_code == 200:
-            scan_data = response.json()
-            
-            print("\n=== DADOS DO SCAN ===")
-            print(f"Timestamp: {time.strftime('%H:%M:%S')}")
-        
-             # Processa dados do scan
-            success = self.world_model.update_from_scan(scan_data)
+    def get_self_state(self):
+        try:
+            response = requests.get(
+                f"{self.api_base}/player/{self.player_id}/state",
+                timeout=1
+            )
+            if response.status_code == 404:
+                print(f"[WARN] Player state not found for {self.player_id}")
+                return None
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"[ERROR] Exception getting player state: {e}")
+            return None
 
-            # Verifica inimigos próximos
-            self.world_model.has_nearby_enemies()
-            
-            # Mostra mapa local
-            self.world_model.print_local_grid(radius=10)
-            
-            return success
-    
-        print("❌ Falha ao obter dados do scan")
-        return False
+    def get_scan(self):
+        now = time.time()
+        if now - self.last_scan_time < self.scan_cooldown:
+            time.sleep(self.scan_cooldown - (now - self.last_scan_time))
 
-    def strategic_movement(self):
-        if not self.game_started:
-            return
-        
-        # Atualiza o mapa de navegação
-        nav_map = self.world_model.get_navigation_map()
-        
-        # Debug: mostra o estado atual
-        print("\n🧭 Estado Atual:")
-        print(f"- Posição: {self.world_model.agent_pos}")
-        print(f"- Ângulo: {math.degrees(self.world_model.agent_angle):.1f}°")
-        '''
-        # Encontra direção segura
-        safe_dir = self.world_model.find_safe_direction()
-        print(f"🎯 Direção escolhida: {safe_dir.upper()}")
-        
-        # Executa ação
-        if safe_dir == 'front':
-            self.robust_request("POST", f"/player/{self.player_id}/thrust_forward")
-        elif safe_dir == 'right':
-            self.robust_request("POST", f"/player/{self.player_id}/rotate_right")
-        elif safe_dir == 'left':
-            self.robust_request("POST", f"/player/{self.player_id}/rotate_left")
-        else:  # back
-            self.robust_request("POST", f"/player/{self.player_id}/thrust_backward")
-        
-        # Atualiza posição estimada
-        self.world_model.update_position(
-            movement=1.0, 
-            rotation=0.1 if safe_dir == 'right' else -0.1 if safe_dir == 'left' else 0
-        )
-        '''
+        try:
+            response = requests.get(
+                f"{self.api_base}/player/{self.player_id}/scan",
+                timeout=1
+            )
+            self.last_scan_time = time.time()
+
+            if response.status_code == 429:
+                wait_time = float(response.headers.get('Retry-After', 0.6))
+                time.sleep(wait_time)
+                return self.get_scan()
+            elif response.status_code == 200:
+                return response.json()
+            else:
+                print(f"[WARN] Scan failed with status {response.status_code}")
+                return None
+        except requests.exceptions.RequestException as e:
+            print(f"[ERROR] Scan exception: {e}")
+            return None
+
+    def send_action(self, action: str):
+        try:
+            response = requests.post(
+                f"{self.api_base}/player/{self.player_id}/{action}",
+                timeout=1
+            )
+            if response.status_code != 200:
+                print(f"[WARN] Action '{action}' failed with status {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"[ERROR] Failed to send action '{action}': {e}")
+
+    def rotate_left(self):
+        self.send_action("rotate_left")
+
+    def rotate_right(self):
+        self.send_action("rotate_right")
+
+    def thrust(self):
+        self.send_action("thrust_forward")
+
+    def basic_movement(self):
+        self.send_action("rotate_right")
+        self.send_action("thrust_forward")
+
     def run(self):
-        """Loop principal do agente"""
-        if not self.send_ready():
-            print("⚠️ Atenção: Sinal de pronto não confirmado - continuando...")
-
-        print("🕒 Aguardando início do jogo...")
-        start_time = time.time()
-        
-        # Espera ativa pelo início do jogo
-        while time.time() - start_time < 30:
-            if self.update_scan_data():
-                self.game_started = True
-                print("🎮 JOGO INICIADO!")
-                break
-            time.sleep(0.5)
-        
-        if not self.game_started:
-            print("❌ Timeout: Jogo não iniciou")
+        if not self.connect():
             return
-    
-        # Loop principal do jogo
-        while self.game_started:
-            try:
-                # Atualiza estados
-                self.update_game_state()
-                has_enemies = self.update_scan_data()
-                
-                # Executa movimento estratégico
-                self.strategic_movement()
-                
-                # Intervalo para reduzir carga
-                time.sleep(0.3)
-                
-            except KeyboardInterrupt:
-                print("\n🛑 Agente interrompido pelo usuário")
-                break
-            except Exception as e:
-                print(f"\n⚠️ Erro no loop principal: {str(e)}")
-                time.sleep(1)
+
+        self.ready_up()
+        print("[INFO] Agent running...")
+
+        try:
+            while True:
+                scan = self.get_scan()
+                self_state = self.get_self_state()
+
+                if not scan or "nearby_objects" not in scan or not self_state:
+                    time.sleep(0.1)
+                    continue
+
+                # Atualiza o modelo do mundo
+                self.world_model.update_pose(self_state)
+                self.world_model.update_from_scan(scan)
+
+                # Estado atual
+                position = self_state.get("position") or self_state.get("pos") or [0, 0]
+                orientation = self_state.get("orientation") or self_state.get("angle") or 0
+
+                # Objetivo: seguir inimigo mais próximo
+                enemy_pos = self.world_model.get_closest_enemy_position()
+
+                now = time.time()
+
+                if enemy_pos:
+                    # Se há inimigo, o objetivo é esse
+                    goal = enemy_pos
+                    # Replaneia sempre que há inimigo
+                    self.path = self.world_model.plan_path_a_star(position, goal)
+                    self.last_plan_time = now
+                else:
+                    goal = self.world_model.get_random_free_goal(position)
+                    new_path = self.world_model.plan_path_a_star(position, goal)
+                    if new_path:
+                        self.path = new_path
+                        self.last_plan_time = now
+                    else:
+                        print("[DEBUG] Caminho não encontrado. Ignorar este goal.")
+                        self.path = []  # <- evita reutilizar caminho inválido
+
+                print(f"[DEBUG] Planeado {len(self.path)} passos até goal {goal}")
+                # Movimento pelo caminho
+                if self.path:
+                    next_target = self.path[0]
+                    dx = next_target[0] - position[0]
+                    dy = next_target[1] - position[1]
+                    angle_to_target = math.atan2(dy, dx)
+                    angle_diff = (angle_to_target - orientation + math.pi) % (2 * math.pi) - math.pi
+
+                    if abs(angle_diff) > 0.3:
+                        if angle_diff > 0:
+                            self.rotate_right()
+                        else:
+                            self.rotate_left()
+                    else:
+                        self.thrust()
+                        if math.hypot(dx, dy) < 5:
+                            self.path.pop(0)
+                #print(f"[DEBUG] Dir. alvo: {angle_to_target:.2f} rad | Dir. atual: {orientation:.2f} | Diferença: {angle_diff:.2f}")
+
+                # Disparo automático se inimigo estiver alinhado
+                for obj in scan.get("nearby_objects", []):
+                    if obj["type"] == "other_player":
+                        rel_x, rel_y = obj["relative_position"]
+                        angle_to_enemy = math.atan2(rel_y, rel_x)
+                        if abs(angle_to_enemy) < 0.26:  # ±15 graus
+                            now = time.time()
+                            if now - self.last_shot_time > self.shot_cooldown:
+                                print("[DEBUG] ALINHADO! DISPARAR!")
+                                self.send_action("shoot")
+                                self.last_shot_time = now
+
+                time.sleep(0.05)
+
+        except KeyboardInterrupt:
+            print("\n[INFO] Agent stopped by user")
+        except Exception as e:
+            print(f"[ERROR] Unexpected error in main loop: {e}")
 
 if __name__ == "__main__":
-    try:
-        agent = SmartAgent()
-        agent.run()
-    except Exception as e:
-        print(f"❌ Erro fatal: {str(e)}")
+    agent = SmartAgent()
+    agent.run()
