@@ -43,7 +43,7 @@ SCORE_CONFIG = {
 }
 
 # --- Game State Configuration ---
-MAX_GAME_DURATION = 30           # Maximum duration of the game in seconds
+MAX_GAME_DURATION = 120           # Maximum duration of the game in seconds
 PLOT_OUTPUT = False              # If True, game statistics plots are saved upon game end
 
 # # --- Game State Configuration ---
